@@ -1,0 +1,28 @@
+# Ejecuta el proyecto en Docker Desktop con la misma imagen que se despliega en Cloud Run.
+#   docker compose up --build      → abre http://localhost:8080
+#   docker compose down            → lo detiene
+# Usa tu SQL Server local (el de tu computadora) y las claves de backend/.env.
+services:
+  app:
+    build: .
+    image: gestion-servicios:local
+    container_name: gestion-servicios
+    ports:
+      - "8080:8080"
+    env_file:
+      - backend/.env
+    environment:
+      # Dentro del contenedor "localhost" es el propio contenedor: tu PC se llama host.docker.internal
+      DB_SERVER: host.docker.internal
+      HOST: 0.0.0.0
+      PORT: "8080"
+      FRONTEND_URL: http://localhost:8080
+      CORS_ORIGIN: http://localhost:8080
+      # Los archivos se guardan en las mismas carpetas de backend/ que usa el modo de desarrollo
+      DATOS_DIR: /datos
+      # Las tareas programadas ya las corre "npm run dev"; si ese no está encendido, cambia a "on"
+      TAREAS: "off"
+    volumes:
+      - ./backend/uploads:/datos/uploads
+      - ./backend/storage:/datos/storage
+    restart: unless-stopped

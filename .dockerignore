@@ -1,0 +1,16 @@
+# No entran a la imagen: dependencias locales, compilados, claves ni archivos de usuarios
+.git
+.github
+.vscode
+node_modules
+dist
+backend/node_modules
+backend/.env
+**/.env
+backend/uploads
+backend/storage
+*.log
+Dockerfile
+cloudbuild.yaml
+despliegue
+docker-compose.yml

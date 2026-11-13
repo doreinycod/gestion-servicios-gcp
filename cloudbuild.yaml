@@ -1,0 +1,66 @@
+# Cloud Build: construye la imagen, la sube a Artifact Registry y la despliega en Cloud Run.
+# Lo ejecuta GitHub Actions (gcloud builds submit) en cada push a main; también se puede lanzar a mano:
+#   gcloud builds submit --config cloudbuild.yaml --region us-east1 --substitutions=_TAG=manual
+substitutions:
+  _REGION: us-east1                       # Carolina del Sur: la región de Cloud Run más cercana a RD
+  _SERVICIO: gestion-servicios            # nombre del servicio en Cloud Run
+  _REPOSITORIO: gestion-servicios         # repositorio de Artifact Registry
+  _SA_APP: app-gestion                    # cuenta de servicio con la que corre la aplicación
+  _BUCKET: ${PROJECT_ID}-gestion-datos    # bucket con los adjuntos y XML (se monta en /datos)
+  _TAG: manual                            # GitHub Actions envía el commit
+options:
+  logging: CLOUD_LOGGING_ONLY
+  dynamicSubstitutions: true
+
+steps:
+  - id: construir
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORIO}/${_SERVICIO}:${_TAG}
+      - -t
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORIO}/${_SERVICIO}:latest
+      - .
+
+  - id: subir
+    name: gcr.io/cloud-builders/docker
+    args: [push, --all-tags, '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORIO}/${_SERVICIO}']
+
+  - id: desplegar
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICIO}
+      - --image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORIO}/${_SERVICIO}:${_TAG}
+      - --region=${_REGION}
+      - --service-account=${_SA_APP}@${PROJECT_ID}.iam.gserviceaccount.com
+      - --allow-unauthenticated
+      - --port=8080
+      - --cpu=1
+      - --memory=1Gi
+      - --timeout=300
+      # Escalado automático: 0 instancias cuando no hay peticiones (no se paga), se levanta una al llegar
+      # la primera petición y hasta 3 si hay mucho tráfico (80 peticiones simultáneas por instancia).
+      # CPU solo mientras atiende peticiones. Las tareas programadas las dispara Cloud Scheduler.
+      - --min-instances=0
+      - --max-instances=3
+      - --concurrency=80
+      - --cpu-throttling
+      - --execution-environment=gen2
+      # Red privada hacia Cloud SQL (IP privada)
+      - --network=default
+      - --subnet=default
+      - --vpc-egress=private-ranges-only
+      # Bucket de Cloud Storage montado como disco: los archivos sobreviven a reinicios y despliegues
+      - --add-volume=name=datos,type=cloud-storage,bucket=${_BUCKET}
+      - --add-volume-mount=volume=datos,mount-path=/datos
+      # Configuración sin secretos (despliegue/cloudrun.env.yaml) y secretos desde Secret Manager
+      - --env-vars-file=despliegue/cloudrun.env.yaml
+      - --update-secrets=DB_PASSWORD=db-password:latest,JWT_SECRET=jwt-secret:latest,ECF_API_KEY=ecf-api-key:latest,GEMINI_API_KEY=gemini-api-key:latest,PAYPAL_CLIENT_SECRET=paypal-client-secret:latest,TAREAS_TOKEN=tareas-token:latest
+      - --labels=commit=${_TAG}
+
+images:
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORIO}/${_SERVICIO}:${_TAG}

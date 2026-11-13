@@ -1,0 +1,74 @@
+# CI/CD: en cada pull request verifica el proyecto; en cada push a main además lo despliega en Cloud Run
+# (GitHub Actions → Cloud Build → Artifact Registry → Cloud Run). La autenticación con Google Cloud usa
+# Workload Identity Federation: no se guarda ninguna clave de Google en GitHub.
+name: CI y despliegue
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: despliegue-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verificar:
+    name: Verificar (lint y build)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            backend/package-lock.json
+      - name: Dependencias del frontend
+        run: npm ci
+      - name: Dependencias del backend
+        run: npm ci
+        working-directory: backend
+      - name: Lint (frontend y backend)
+        run: npm run lint
+      - name: Compilar el frontend
+        run: npm run build
+
+  desplegar:
+    name: Desplegar en Cloud Run
+    needs: verificar
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: produccion
+    permissions:
+      contents: read
+      id-token: write   # token OIDC para Workload Identity Federation
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Autenticarse en Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_GITHUB }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Construir y desplegar con Cloud Build
+        run: |
+          gcloud builds submit \
+            --config cloudbuild.yaml \
+            --region "${{ vars.GCP_REGION }}" \
+            --service-account "projects/${{ vars.GCP_PROJECT_ID }}/serviceAccounts/cloudbuild-gestion@${{ vars.GCP_PROJECT_ID }}.iam.gserviceaccount.com" \
+            --substitutions "_TAG=${GITHUB_SHA::7},_REGION=${{ vars.GCP_REGION }}"
+
+      - name: URL del servicio
+        run: |
+          URL=$(gcloud run services describe gestion-servicios --region "${{ vars.GCP_REGION }}" --format 'value(status.url)')
+          echo "Desplegado en $URL"
+          echo "### 🚀 Desplegado: $URL" >> "$GITHUB_STEP_SUMMARY"
