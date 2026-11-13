@@ -9,8 +9,8 @@
 # =====================================================================
 set -euo pipefail
 
-PROYECTO="mi-proyecto-gcp"            # CAMBIAR: id del proyecto de Google Cloud
-REPO_GITHUB="usuario/GestionServicios" # CAMBIAR: dueño/repositorio en GitHub
+PROYECTO="gestion-servicios-514611"   # id del proyecto de Google Cloud
+REPO_GITHUB="doreinycod/gestion-servicios-gcp" # dueño/repositorio en GitHub
 REGION="us-east1"
 
 SERVICIO="gestion-servicios"

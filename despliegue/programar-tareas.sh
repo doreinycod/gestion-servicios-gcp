@@ -8,7 +8,7 @@
 # =====================================================================
 set -euo pipefail
 
-PROYECTO="mi-proyecto-gcp"   # CAMBIAR: el mismo de configurar-gcp.sh
+PROYECTO="gestion-servicios-514611"   # el mismo de configurar-gcp.sh
 REGION="us-east1"
 SERVICIO="gestion-servicios"
 
