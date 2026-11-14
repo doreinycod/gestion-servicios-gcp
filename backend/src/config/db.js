@@ -11,7 +11,11 @@ const config = {
   user: process.env.DB_USER || 'sa',
   password: process.env.DB_PASSWORD || '',
   // Cloud SQL: DB_ENCRYPT=true cifra la conexión (TLS); en local queda sin cifrar como antes
-  options: { encrypt: process.env.DB_ENCRYPT === 'true', trustServerCertificate: process.env.DB_TRUST_CERT !== 'false', useUTC: false },
+  options: {
+    encrypt: process.env.DB_ENCRYPT === 'true', trustServerCertificate: process.env.DB_TRUST_CERT !== 'false', useUTC: false,
+    // Node 26+ no acepta una IP como nombre TLS (Cloud SQL se conecta por IP privada); el certificado ya se confía
+    ...(/^\d+\.\d+\.\d+\.\d+$/.test(process.env.DB_SERVER || '') ? { serverName: 'cloudsql' } : {}),
+  },
   pool: { max: 10, min: 0, idleTimeoutMillis: 30000 },
 }
 
