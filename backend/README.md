@@ -73,6 +73,14 @@ backend/
 | MOD-IA | `POST /ia/conversaciones`, `GET /ia/conversaciones[/:id/mensajes]`, `POST /ia/conversaciones/:id/mensajes`, `POST /ia/sugerencias/:id/aceptar` |
 | MOD-ADM | `GET /admin/dashboard`, `GET /admin/prestadores`, `POST /admin/prestadores/:id/decision`, `GET/POST/PATCH /admin/usuarios`, `GET/PUT /admin/permisos`, `GET /admin/reportes/:tipo[?formato=csv]`, `GET /admin/pagos`, `POST /admin/pagos/:id/conciliar\|reembolsar`, `GET/POST /admin/facturacion/secuencias`, `GET /admin/facturacion/comprobantes`, `POST /admin/facturacion/ecf/:id/reenviar`, `GET /admin/facturacion/607`, `GET /admin/solicitudes`, `POST /admin/solicitudes/:codigo/asignar` |
 
+## Consultas y reportes
+
+30 definiciones en `src/lib/reportes.js` (15 consultas y 15 reportes): cliente 8, prestador 8 y administrador 14.
+Cada una declara su rol, filtros (periodo, búsqueda, estado), columnas, consulta, resumen y gráfica.
+`GET /api/reportes` devuelve el catálogo del rol y `GET /api/reportes/:id?desde&hasta&q&estado[&formato=csv]` los datos o el CSV.
+El cliente y el prestador solo ven sus propios datos; un rol no puede abrir los reportes de otro.
+En el frontend, una sola pantalla (`Reportes` en mod-adm.jsx) sirve a los tres roles: `/consultas`, `/prestador/reportes` y `/admin/reportes`.
+
 ## Reglas implementadas
 
 - Contraseñas con bcrypt. Tras 3 intentos fallidos la cuenta queda bloqueada 15 minutos. La sesión es un JWT de 30 minutos.

@@ -111,6 +111,25 @@ export async function transaction(fn) {
   }
 }
 
+/**
+ * Consulta de solo lectura para el asistente IA (consultas libres del administrador).
+ * Corre dentro de una transacción que SIEMPRE se revierte, con límite de tiempo y de filas:
+ * aunque la sentencia intentara modificar algo, no quedaría ningún cambio.
+ */
+export async function consultaSoloLectura(texto, { limite = 1000, timeoutMs = 15_000 } = {}) {
+  const tx = new sql.Transaction(await getPool())
+  await tx.begin(sql.ISOLATION_LEVEL.READ_COMMITTED)
+  const req = new sql.Request(tx)
+  const reloj = setTimeout(() => req.cancel(), timeoutMs)
+  try {
+    const r = await req.query(`SET NOCOUNT ON; SET LOCK_TIMEOUT 5000; ${texto}`)
+    return (r.recordset || []).slice(0, limite)
+  } finally {
+    clearTimeout(reloj)
+    try { await tx.rollback() } catch { /* ya revertida */ }
+  }
+}
+
 export async function verificarConexion() {
   return one('SELECT @@VERSION AS version, DB_NAME() AS db')
 }

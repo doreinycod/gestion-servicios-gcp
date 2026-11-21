@@ -12,6 +12,7 @@ import { HttpError, badRequest, conflict, validar, notFound } from '../lib/http.
 import { cedulaValida, rncValido, emailValido, telefonoValido, contrasenaValida, nombreValido } from '../lib/fiscal.js'
 import { upload, urlArchivo } from '../lib/upload.js'
 import { estadoCobro } from '../lib/totales.js'
+import { catalogoReportes, ejecutarReporte, reporteCsv } from '../lib/reportes.js'
 
 /**
  * ADM-P06 · Servicio transversal de notificaciones.
@@ -676,6 +677,21 @@ rMenu.get('/contadores', autenticar, async (req, res) => {
   res.json({ '/admin/prestadores': r.prestadores, '/admin/pagos': r.pagos, '/admin/facturacion': r.facturacion, '/admin/solicitudes': r.sin_asignar })
 })
 
+// ---------- ADM-P05 · Consultas y reportes por rol (definidos en lib/reportes.js) ----------
+const rReportes = Router()
+rReportes.use(autenticar)
+rReportes.get('/', (req, res) => res.json(catalogoReportes(req.usuario.nombre_rol)))
+rReportes.get('/:id', async (req, res) => {
+  const r = await ejecutarReporte(req.params.id, req.usuario, req.query)
+  if (!r) throw notFound('Consulta o reporte no disponible')
+  if (req.query.formato === 'csv') {
+    return res.type('text/csv; charset=utf-8').attachment(`${r.def.id}_${r.ctx.desde}_${r.ctx.hasta}.csv`.replace(/1900-01-01_2999-12-31/, 'todo')).send(reporteCsv(r))
+  }
+  res.json({ filas: r.filas, resumen: r.resumen, desde: r.ctx.desde, hasta: r.ctx.hasta, generado: new Date().toISOString(),
+    generado_por: `${req.usuario.nombre} ${req.usuario.apellido}` })
+})
+
+router.use('/reportes', rReportes)
 router.use('/menu', rMenu)
 router.use('/auth', rAuth)
 router.use('/notificaciones', rNotificaciones)

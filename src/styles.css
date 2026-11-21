@@ -477,3 +477,44 @@ img { max-width: 100%; }
 .plan.elegido { border-color: var(--green-800); box-shadow: 0 0 0 3px var(--green-100); }
 .plan.actual { cursor: default; opacity: .75; }
 .plan.actual:hover { border-color: var(--border); }
+
+/* Consultas y reportes */
+.nav-item.active-rep { background: var(--green-100); font-weight: 600; }
+.solo-imprimir { display: none; }
+@media print {
+  /* Hoja horizontal para que quepan todas las columnas */
+  @page { size: landscape; margin: 10mm; }
+  * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+  body { background: #fff !important; }
+  .sidebar, .topbar, .backdrop, .no-imprimir, .dropdown { display: none !important; }
+  .app, .main { display: block !important; margin: 0 !important; padding: 0 !important; min-height: 0 !important; }
+  .reportes { display: block !important; }
+  .reportes .col { gap: 10px !important; }
+  .solo-imprimir { display: block; }
+  .card { box-shadow: none !important; border: 1px solid #ddd !important; padding: 10px 12px !important; }
+  /* Tarjetas pequeñas (encabezado, totales, gráfica) no se parten; la tabla sí, para imprimir todas las filas */
+  .reportes .kpi, .reportes .card:not(.tabla-reporte) { break-inside: avoid; }
+  .reportes .grid.g-4 { grid-template-columns: repeat(4, minmax(0, 1fr)) !important; gap: 8px !important; }
+  .reportes .kpi { padding: 8px 10px !important; }
+  .reportes .kpi-value { font-size: 16px !important; }
+  .table-wrap { overflow: visible !important; }
+  .tabla-reporte .table { font-size: 9.5px; table-layout: auto; }
+  .tabla-reporte .table th, .tabla-reporte .table td { padding: 4px 5px !important; white-space: normal !important; word-break: break-word; }
+  .tabla-reporte thead { display: table-header-group; } /* el encabezado se repite en cada página */
+  .tabla-reporte tr { break-inside: avoid; }
+  .bars { height: 130px !important; }
+}
+
+/* Imprimir solo una tarjeta del asistente IA (consulta libre), con todas sus filas */
+@media print {
+  body.imprimiendo-tarjeta * { visibility: hidden !important; }
+  body.imprimiendo-tarjeta .tarjeta-a-imprimir, body.imprimiendo-tarjeta .tarjeta-a-imprimir * { visibility: visible !important; }
+  body.imprimiendo-tarjeta .tarjeta-a-imprimir { position: absolute; left: 0; top: 0; width: 100%; border: 0 !important; }
+  body.imprimiendo-tarjeta .tarjeta-a-imprimir .no-imprimir { display: none !important; }
+  body.imprimiendo-tarjeta .tarjeta-a-imprimir .solo-imprimir { display: block !important; }
+  .tarjeta-a-imprimir .tabla-ia { max-height: none !important; overflow: visible !important; border: 0 !important; }
+  .tarjeta-a-imprimir .table { font-size: 9.5px; }
+  .tarjeta-a-imprimir .table th, .tarjeta-a-imprimir .table td { padding: 4px 5px !important; white-space: normal !important; }
+  .tarjeta-a-imprimir thead { position: static !important; display: table-header-group; }
+  .tarjeta-a-imprimir tr { break-inside: avoid; }
+}

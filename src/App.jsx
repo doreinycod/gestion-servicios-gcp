@@ -7,7 +7,7 @@ import { Catalogo, PerfilPrestador, RegistroPrestador, CatalogoAdmin, Planes, Pl
 import { NuevaSolicitud, Seguimiento, MisSolicitudes, PanelPrestador, Asignaciones, Agenda, Calificaciones, PerfilPrestadorPropio, SolicitudesAdmin } from './modulos/mod-sol'
 import { Pagar, PaypalRetorno, Recibo, PagosCliente, Cobros, Conciliacion, Ganancias, CuentasPrestadores } from './modulos/mod-pag'
 import { MisFacturas, FacturaPDF, Facturacion } from './modulos/mod-fac'
-import { Asistente, AsistenteAdmin } from './modulos/mod-ia'
+import { Asistente, AsistenteGestion } from './modulos/mod-ia'
 import { Login, Registro, OlvideContrasena, RestablecerContrasena, MiPerfil, Dashboard, PrestadoresAdmin, Usuarios, Reportes, Configuracion } from './modulos/mod-adm'
 
 function Inicio() {
@@ -41,6 +41,7 @@ export default function App() {
         <Route path="/planes" element={<Planes />} />
         <Route path="/asistente" element={<Asistente />} />
         <Route path="/perfil" element={<MiPerfil />} />
+        <Route path="/consultas" element={<Reportes />} />
       </Route>
 
       {/* Prestador (empleado): SOL-P04, PAG-P05 */}
@@ -56,6 +57,8 @@ export default function App() {
         <Route path="/prestador/paypal/retorno" element={<PaypalRetorno />} />
         <Route path="/prestador/calificaciones" element={<Calificaciones />} />
         <Route path="/prestador/perfil" element={<PerfilPrestadorPropio />} />
+        <Route path="/prestador/reportes" element={<Reportes />} />
+        <Route path="/prestador/asistente" element={<AsistenteGestion />} />
       </Route>
 
       {/* Administrador: MOD-ADM y paneles de control */}
@@ -68,7 +71,7 @@ export default function App() {
         <Route path="/admin/cuentas-prestadores" element={<CuentasPrestadores />} />
         <Route path="/admin/facturacion" element={<Facturacion />} />
         <Route path="/admin/planes" element={<PlanesAdmin />} />
-        <Route path="/admin/asistente" element={<AsistenteAdmin />} />
+        <Route path="/admin/asistente" element={<AsistenteGestion />} />
         <Route path="/admin/usuarios" element={<Usuarios />} />
         <Route path="/admin/reportes" element={<Reportes />} />
         <Route path="/admin/configuracion" element={<Configuracion />} />

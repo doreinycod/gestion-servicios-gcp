@@ -6,9 +6,10 @@ import Anthropic from '@anthropic-ai/sdk'
 import { z } from 'zod'
 import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod'
 import { Router } from 'express'
-import { exec, one, query, AHORA } from '../config/db.js'
+import { exec, one, query, AHORA, consultaSoloLectura } from '../config/db.js'
 import { autenticar, soloRol } from '../middleware/auth.js'
 import { forbidden, HttpError, notFound, validar } from '../lib/http.js'
+import { catalogoReportes, ejecutarReporte } from '../lib/reportes.js'
 
 // Proceso 5.0 · Asistencia virtual. Responde con base en v_contextoCatalogo y sugiere un id_servicio.
 // Proveedor: Gemini (GEMINI_API_KEY) → Claude (ANTHROPIC_API_KEY) → respuestas por palabras clave (modo local).
@@ -310,6 +311,9 @@ const tarjetaPrestador = (e) => ({
 
 // IA-P01 · Chat del asistente virtual (proceso 5.0). El asistente solo informa y sugiere:
 // no crea solicitudes, no procesa pagos y no cambia estados.
+// Pedidos de datos propios en el chat del cliente (se resuelven con el agente de reportes)
+const PIDE_DATOS = /report|informe|lista|listado|historial|resumen|cu[aá]nt[oa]s?\b|total|factur|comprobante|ncf|pagu[eé]|pagos?\b|pagad|itbis|gast|estado de cuenta|mis solicitudes|solicitudes que|nota de cr[eé]dito|ahorr|pdf|excel|descarg|imprim/i
+
 const rIa = Router()
 rIa.use(autenticar, soloRol('Cliente'))
 const LIMITE_HORA = 30
@@ -374,6 +378,19 @@ rIa.post('/conversaciones/:id/mensajes', async (req, res) => {
   const historial = (await query(
     'SELECT TOP 10 emisor, contenido FROM ia_mensajes WHERE id_conversacion = ? ORDER BY id_mensaje DESC', [c.id_conversacion])).reverse()
   await exec("INSERT INTO ia_mensajes (id_conversacion, emisor, contenido) VALUES (?, 'Cliente', ?)", [c.id_conversacion, pregunta])
+
+  // Si pide datos suyos (facturas, pagos, solicitudes, ITBIS, gastos…), se genera el reporte en el mismo chat
+  // ("¿cuánto cuesta…?" o "precio de…" siguen yendo al asistente de servicios, salvo que hable de sus pagos o facturas)
+  const preguntaPrecio = /cuesta|cobran|precio|tarifa|vale /i.test(pregunta) && !/factur|pagu|pagad|mis |mi /i.test(pregunta)
+  if (PIDE_DATOS.test(pregunta) && !preguntaPrecio) {
+    const historialRep = historial.map((m) => ({ rol: m.emisor === 'Cliente' ? 'user' : 'model', texto: m.contenido }))
+    const rep = await agenteReportes(req, pregunta, historialRep).catch((e) => { console.error('[IA chat reportes]', e.message); return null })
+    if (rep?.reportes?.length) {
+      await exec("INSERT INTO ia_mensajes (id_conversacion, emisor, contenido, tokens) VALUES (?, 'Asistente', ?, ?)",
+        [c.id_conversacion, rep.respuesta, rep.tokens || null])
+      return res.json({ respuesta: rep.respuesta, sugerencias: [], prestadores: [], reportes: rep.reportes, modo: modoIA() })
+    }
+  }
 
   // v_contextoCatalogo: servicios Publicados con su calificación y los prestadores aprobados
   const [servicios, prestadores] = await Promise.all([cargarServicios(), cargarPrestadores()])
@@ -453,7 +470,381 @@ export async function cerrarConversaciones() {
   return r.affectedRows
 }
 
+// =====================================================================
+// IA-P03 · Asistente de reportes (todos los roles).
+// Gemini recibe una herramienta, ejecutar_reporte, limitada a las consultas y reportes del rol
+// (lib/reportes.js). La IA elige el reporte y los filtros; el sistema lo ejecuta con los permisos
+// del usuario y la IA resume el resultado. La IA nunca escribe SQL ni ve datos de otros usuarios.
+// =====================================================================
+const LIMITE_REPORTES_HORA = 30
+// Elegir un reporte y resumir cifras no necesita el modelo grande: los "lite" responden en ≈ 1 s
+// y eligen el reporte y las fechas igual de bien. Si están saturados se pasa al siguiente.
+const MODELOS_REPORTES = [...new Set([process.env.GEMINI_MODELO_REPORTES, 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.5-flash'].filter(Boolean))]
+const usoReportes = new Map() // id_usuario → marcas de tiempo de la última hora
+
+// Guía de uso por rol: el asistente también responde "¿cómo hago…?" con las pantallas reales del sistema
+const GUIA_ROL = {
+  Administrador: `Menú del administrador y qué se hace en cada opción:
+- Dashboard: indicadores del periodo, ingresos, solicitudes por estado y alertas (pagos por conciliar, prestadores por aprobar, e-CF rechazados).
+- Catálogo y servicios: crear, editar, publicar o pausar servicios y sus precios.
+- Prestadores: aprobar, rechazar o pedir documentos a los prestadores que se registran (revisar documentos y lista de verificación).
+- Solicitudes: ver todas las solicitudes y asignar prestador manualmente cuando la asignación automática no encontró a nadie.
+- Conciliación de pagos: confirmar o rechazar transferencias y cobros en efectivo; reembolsar un pago confirmado (emite nota de crédito).
+- Cuentas de prestadores: comisiones y liquidaciones de los prestadores.
+- Facturación e-CF: comprobantes y su estado en la DGII, reintentar emisión, corregir y reenviar rechazados, notas de crédito, solicitudes de nota de crédito de clientes, secuencias e-NCF y exportar el 607.
+- Planes y suscripciones: planes para clientes y membresías de prestadores.
+- Usuarios y roles: cuentas y permisos. Consultas y reportes: las 14 consultas y reportes del administrador con Excel y PDF.
+- Configuración: datos de la empresa, ITBIS, tasa del dólar, plazos y límites.`,
+  Empleado: `Menú del prestador y qué se hace en cada opción:
+- Mi panel: resumen del día, asignaciones nuevas y agenda de hoy; cambiar disponibilidad (Disponible, Ocupado, No disponible).
+- Asignaciones: aceptar o rechazar una asignación (hay 2 horas para responder), marcar el servicio completado (requiere anticipo pagado; se pueden agregar materiales),
+  reportar un cobro en efectivo (anticipo, saldo o cargo) y solicitar un cargo adicional al cliente después de completado y pagado (el cliente lo acepta o rechaza).
+- Agenda: citas por día. Cobros en efectivo: recibos reportados y su conciliación. Mis ganancias: lo cobrado, la comisión y la liquidación.
+- Membresía: planes para prestadores (menor comisión o prioridad en la asignación). Mis facturas: facturas de la membresía.
+- Calificaciones: reseñas de los clientes. Mi perfil y disponibilidad: especialidad, tarifa, zona de cobertura y horario.
+- Consultas y reportes: las 8 consultas y reportes del prestador con Excel y PDF.`,
+  Cliente: `El cliente pide servicios en Nueva solicitud, sigue su estado en Mis solicitudes, paga 50 % de anticipo y 50 % al terminar,
+elige comprobante e31 o e32 al pagar y ve sus facturas en Mis facturas (allí puede solicitar crédito fiscal o nota de crédito).`,
+}
+const FECHA_RD = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Santo_Domingo', year: 'numeric', month: '2-digit', day: '2-digit' })
+const DIA_RD = new Intl.DateTimeFormat('es-DO', { timeZone: 'America/Santo_Domingo', weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })
+
+/** Envía la petición a Gemini probando los modelos en orden (saturado, límite o retirado → el siguiente). */
+async function llamarGemini(cuerpo) {
+  for (const modelo of MODELOS_REPORTES) {
+    let r
+    try {
+      r = await fetch(`${GEMINI_URL}/${modelo}:generateContent`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
+        signal: AbortSignal.timeout(12_000), body: JSON.stringify(cuerpo),
+      })
+    } catch (e) {
+      console.warn(`[IA reportes] ${modelo}:`, e.name === 'TimeoutError' ? 'tiempo de espera agotado' : e.message)
+      continue
+    }
+    const d = await r.json().catch(() => ({}))
+    if (r.ok) return d
+    console.warn(`[IA reportes] ${modelo} ${r.status}:`, d?.error?.message?.slice(0, 160) || 'error')
+    if (![404, 429, 500, 503].includes(r.status)) return null
+  }
+  return null
+}
+
+/** Resultado compacto para la IA: totales y hasta 25 filas con los títulos de las columnas. */
+function resultadoParaIA(r, def) {
+  const valor = (v) => (v instanceof Date ? v.toISOString().slice(0, 16).replace('T', ' ') : v)
+  return {
+    reporte: def.titulo, periodo: r.ctx.desde === '1900-01-01' ? 'todo el historial' : `${r.ctx.desde} a ${r.ctx.hasta}`,
+    busqueda: r.ctx.q, estado: r.ctx.estado, total_filas: r.filas.length,
+    resumen: Object.fromEntries(r.resumen.map((x) => [x.t, x.v])),
+    filas: r.filas.slice(0, 25).map((f) => Object.fromEntries(def.columnas.map((c) => [c.t, valor(f[c.k])]))),
+    nota: r.filas.length > 25 ? `Se muestran 25 de ${r.filas.length} filas; los totales del resumen incluyen todas.` : undefined,
+  }
+}
+
+/** Tarjeta para el chat: resumen y primeras filas del reporte ejecutado. */
+const tarjetaReporte = (r, def, formato = 'pantalla') => ({
+  id: def.id, titulo: def.titulo, tipo: def.tipo, icono: def.icono, formato,
+  desde: r.ctx.desde === '1900-01-01' ? '' : r.ctx.desde, hasta: r.ctx.hasta === '2999-12-31' ? '' : r.ctx.hasta,
+  q: r.ctx.q || '', estado: r.ctx.estado || '', resumen: r.resumen, columnas: def.columnas, filas: r.filas.slice(0, 200), total_filas: r.filas.length,
+})
+
+/** Sin Gemini: elige el reporte cuyo título y descripción se parecen más a la pregunta y lo ejecuta para este año. */
+async function reporteLocal(pregunta, usuario, catalogo) {
+  const palabras = sinTildes(pregunta).split(/[^a-z0-9ñ]+/).filter((w) => w.length > 3)
+  const puntos = (d) => palabras.filter((w) => sinTildes(`${d.titulo} ${d.descripcion}`).includes(w.slice(0, 6))).length
+  const mejor = [...catalogo].sort((a, b) => puntos(b) - puntos(a))[0]
+  if (!mejor || !puntos(mejor)) {
+    return { respuesta: `Puedo prepararte estos reportes: ${catalogo.map((d) => d.titulo).join(', ')}. ¿Cuál necesitas?`, reportes: [] }
+  }
+  const anio = FECHA_RD.format(new Date()).slice(0, 4)
+  const r = await ejecutarReporte(mejor.id, usuario, mejor.filtros.periodo ? { desde: `${anio}-01-01`, hasta: FECHA_RD.format(new Date()) } : {})
+  const formato = /pdf|imprim/i.test(pregunta) ? 'pdf' : /excel|descarg|hoja de c/i.test(pregunta) ? 'excel' : 'pantalla'
+  return { respuesta: `Aquí tienes "${mejor.titulo}"${mejor.filtros.periodo ? ' de este año' : ''}.`, reportes: [tarjetaReporte(r, r.def, formato)] }
+}
+
+
+// ---------- Consultas libres del administrador (solo lectura) ----------
+// Cuando ningún reporte cubre lo pedido, la IA escribe una consulta SELECT sobre el esquema real.
+// El servidor la valida (una sola SELECT, sin escrituras ni datos sensibles) y la ejecuta en una
+// transacción que siempre se revierte, con límite de tiempo y de filas.
+const TABLAS_OCULTAS = ['restablecimientos_contrasena', 'paypal_webhooks']
+const COLUMNAS_OCULTAS = ['contrasena_hash', 'token_hash', 'payload_json']
+const PROHIBIDO = /\b(insert|update|delete|merge|drop|alter|create|exec|execute|grant|revoke|deny|truncate|into|openrowset|openquery|opendatasource|bulk|backup|restore|shutdown|dbcc|waitfor|kill|reconfigure|use|declare|set|sp_\w*|xp_\w*)\b/i
+let esquemaCache = null
+
+/** Tablas, columnas y relaciones de la base (sin lo sensible), para que la IA escriba la consulta. */
+async function esquemaBD() {
+  if (esquemaCache && Date.now() - esquemaCache.t < 10 * 60e3) return esquemaCache.texto
+  const cols = await query(
+    `SELECT TABLE_NAME AS t, COLUMN_NAME AS c, DATA_TYPE AS d FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = 'dbo' ORDER BY TABLE_NAME, ORDINAL_POSITION`)
+  const fks = await query(
+    `SELECT OBJECT_NAME(f.parent_object_id) AS t, COL_NAME(fc.parent_object_id, fc.parent_column_id) AS c,
+            OBJECT_NAME(f.referenced_object_id) AS rt, COL_NAME(fc.referenced_object_id, fc.referenced_column_id) AS rc
+       FROM sys.foreign_keys f JOIN sys.foreign_key_columns fc ON fc.constraint_object_id = f.object_id`)
+  const tablas = new Map()
+  for (const x of cols) {
+    if (TABLAS_OCULTAS.includes(x.t) || COLUMNAS_OCULTAS.includes(x.c)) continue
+    if (!tablas.has(x.t)) tablas.set(x.t, [])
+    tablas.get(x.t).push(`${x.c} ${x.d}`)
+  }
+  // Valores reales de las columnas de estado, tipo, modalidad o método (para que la IA no los invente)
+  const categoricas = cols.filter((x) => ['nvarchar', 'varchar', 'char'].includes(x.d) && !TABLAS_OCULTAS.includes(x.t)
+    && /^(estado|estado_\w+|tipo|tipo_\w+|modalidad|metodo_\w+|periodicidad|emisor|canal|nombre_rol)$/.test(x.c))
+  // Valores permitidos por las reglas CHECK (aunque hoy no haya filas con ese valor) + los que existen en los datos
+  const checks = await query(
+    `SELECT OBJECT_NAME(parent_object_id) AS t, definition AS d FROM sys.check_constraints`)
+  const valores = []
+  for (const x of categoricas) {
+    const permitidos = new Set()
+    for (const ck of checks.filter((c) => c.t === x.t && c.d.includes(`[${x.c}]`))) {
+      for (const m of ck.d.matchAll(new RegExp(`\\[${x.c}\\]\\s*=\\s*N?'([^']*)'`, 'g'))) permitidos.add(m[1])
+    }
+    try {
+      const v = await query(`SELECT DISTINCT TOP 13 [${x.c}] AS v FROM [${x.t}] WHERE [${x.c}] IS NOT NULL`)
+      if (v.length <= 12) v.forEach((y) => permitidos.add(y.v))
+    } catch { /* columna sin acceso: se omite */ }
+    if (permitidos.size && permitidos.size <= 15) valores.push(`${x.t}.${x.c}: ${[...permitidos].map((y) => `'${y}'`).join(' | ')}`)
+  }
+  const texto = [...tablas].map(([t, c]) => `${t}(${c.join(', ')})`).join('\n') +
+    '\nValores existentes (usa exactamente estos en los filtros):\n' + valores.join('\n') +
+    '\nRelaciones:\n' + fks.filter((f) => !TABLAS_OCULTAS.includes(f.t)).map((f) => `${f.t}.${f.c} -> ${f.rt}.${f.rc}`).join('\n')
+  esquemaCache = { t: Date.now(), texto }
+  return texto
+}
+
+/** Valida que la consulta sea una sola SELECT de lectura y sin datos sensibles. Devuelve el motivo si no lo es. */
+function validarSql(texto) {
+  const s = String(texto || '').trim().replace(/;\s*$/, '')
+  if (!s) return 'Consulta vacía'
+  if (s.length > 4000) return 'Consulta demasiado larga'
+  if (/--|\/\*/.test(s)) return 'La consulta no puede tener comentarios'
+  if (s.includes(';')) return 'Solo se permite una consulta'
+  if (!/^(select|with)\b/i.test(s)) return 'Solo se permiten consultas SELECT'
+  const m = s.match(PROHIBIDO)
+  if (m) return `No se permite "${m[0]}" (solo lectura)`
+  if (/\bsys\.|\binformation_schema\b|\bmaster\b|\bmsdb\b/i.test(s)) return 'No se permiten tablas del sistema'
+  const oculta = [...TABLAS_OCULTAS, ...COLUMNAS_OCULTAS].find((x) => new RegExp(`\\b${x}\\b`, 'i').test(s))
+  if (oculta) return `No se permite consultar ${oculta}`
+  return null
+}
+
+// SQL Server puede devolver nombres de días y meses en inglés (DATENAME): se traducen en el resultado
+const EN_ES = {
+  Monday: 'Lunes', Tuesday: 'Martes', Wednesday: 'Miércoles', Thursday: 'Jueves', Friday: 'Viernes', Saturday: 'Sábado', Sunday: 'Domingo',
+  January: 'Enero', February: 'Febrero', March: 'Marzo', April: 'Abril', May: 'Mayo', June: 'Junio', July: 'Julio',
+  August: 'Agosto', September: 'Septiembre', October: 'Octubre', November: 'Noviembre', December: 'Diciembre',
+}
+const traducir = (v) => (typeof v === 'string' && EN_ES[v] ? EN_ES[v] : v)
+
+/** Formato de cada columna del resultado según su nombre y su valor. */
+function formatoColumna(nombre, valor) {
+  const n = sinTildes(nombre)
+  if (valor instanceof Date) return 'fechahora'
+  if (typeof valor === 'number') {
+    // "Total solicitudes", "cantidad de pagos"… son conteos, no dinero
+    if (/cantidad|numero|conteo|^n$|^id|veces|dias|suscriptores|suscripciones|solicitudes|clientes|usuarios|servicios|prestadores|pagos$|documentos|filas|intentos|resenas|asignaciones|facturas|notas|conversaciones|mensajes/.test(n)) return 'numero'
+    if (/^total\b/.test(n) && Number.isInteger(valor) && !/monto|precio|itbis|ingreso|pagado|cobrado|comision|costo|venta|saldo|neto|facturado|tarifa|rd\$/.test(n)) return 'numero'
+    if (/monto|total|precio|itbis|ingreso|subtotal|tarifa|pagado|cobrado|comision|costo|venta|saldo|descuento|neto|facturado|rd\$/.test(n)) return 'dinero'
+    if (/pct|porcentaje|%|tasa/.test(n)) return 'pct'
+    if (/calificacion|estrellas|rating/.test(n)) return 'estrellas'
+    return 'numero'
+  }
+  if (typeof valor === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(valor)) return 'fecha'
+  return 'texto'
+}
+
+/** Tarjeta para el chat con el resultado de una consulta libre (columnas tomadas del resultado). */
+function tarjetaConsulta(filas, titulo, sqlTexto, formato) {
+  const claves = Object.keys(filas[0] || {})
+  const columnas = claves.map((k) => ({ k, t: k, f: formatoColumna(k, filas.find((f) => f[k] !== null && f[k] !== undefined)?.[k]) }))
+  const resumen = [{ t: 'Filas', v: filas.length }, ...columnas.filter((c) => c.f === 'dinero').slice(0, 3)
+    .map((c) => ({ t: `Total ${c.t}`, v: round2Ia(filas.reduce((s, f) => s + Number(f[c.k] || 0), 0)), f: 'dinero' }))]
+  return {
+    id: 'consulta-libre', dinamico: true, titulo: String(titulo || 'Consulta').slice(0, 120), tipo: 'reporte', icono: '🧮', formato,
+    desde: '', hasta: '', q: '', estado: '', resumen, columnas, filas, total_filas: filas.length, sql: sqlTexto,
+  }
+}
+/** Deja constancia en la bitácora de cada consulta libre que ejecutó la IA. */
+async function auditarIA(req, sqlTexto, filas) {
+  try {
+    await exec('INSERT INTO bitacora (id_usuario, accion, entidad, valor_nuevo, ip) VALUES (?, ?, ?, ?, ?)',
+      [req.usuario.id_usuario, 'Consulta libre del asistente IA', 'ia', JSON.stringify({ sql: String(sqlTexto).slice(0, 3500), filas }), req.ip || null])
+  } catch (e) { console.error('[IA bitácora]', e.message) }
+}
+const round2Ia = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100
+
+const NOTAS_ESQUEMA = `Notas del negocio para escribir consultas:
+- Pagos cobrados: pagos.estado = 'Confirmado' (monto incluye ITBIS). Tipos: pagos.tipo_pago Total | Anticipo | Saldo | Cargo; metodo_pago PayPal | Tarjeta | Transferencia | Efectivo.
+- Facturas: facturas.tipo_documento Factura | Nota de crédito | Nota de débito; las notas de crédito restan. Vigentes: facturas.estado = 'Emitida'. e-NCF en ecf.ncf.
+- Servicios: servicios.modalidad 'En sitio' (presencial) | 'Remoto' (virtual) | 'Ambas'; estado 'Publicado' es visible. Precio en servicios.precio_base (sin ITBIS).
+- Prestador = empleados (nombre en usuarios por empleados.id_usuario); servicios que ofrece en empleado_servicio. Cliente = clientes (nombre en usuarios o razon_social).
+- Solicitudes: solicitudes_servicio.estado Pendiente | En proceso | Completado | Cancelado; prestador en asignaciones_servicio (estado_asignacion Asignada | Aceptada | Completada | Rechazada).`
+
+const rIaReportes = Router()
+rIaReportes.use(autenticar)
+
+rIaReportes.post('/', async (req, res) => {
+  const pregunta = String(req.body.pregunta || '').trim()
+  validar({ pregunta: !(pregunta.length >= 2 && pregunta.length <= 600) && 'Escribe tu pedido (hasta 600 caracteres)' })
+  const uso = (usoReportes.get(req.usuario.id_usuario) || []).filter((t) => Date.now() - t < 3600e3)
+  if (uso.length >= LIMITE_REPORTES_HORA) throw new HttpError(429, 'Has alcanzado el límite de pedidos a la IA por hora; intenta más tarde')
+  usoReportes.set(req.usuario.id_usuario, [...uso, Date.now()])
+  res.json(await agenteReportes(req, pregunta, req.body.historial))
+})
+
+/**
+ * Agente de reportes: la IA elige y ejecuta reportes (o una consulta libre si es administrador) y resume el resultado.
+ * Lo usan el Asistente IA del administrador y del prestador, y el chat del cliente cuando pide datos suyos.
+ * historialEntrada: [{ rol: 'user' | 'model', texto }]
+ */
+async function agenteReportes(req, pregunta, historialEntrada) {
+  const catalogo = catalogoReportes(req.usuario.nombre_rol)
+  if (!catalogo.length) throw new HttpError(403, 'Tu rol no tiene reportes disponibles')
+  if (!process.env.GEMINI_API_KEY) return { ...(await reporteLocal(pregunta, req.usuario, catalogo)), modo: 'local' }
+
+  const hoy = FECHA_RD.format(new Date())
+  const lista = catalogo.map((d) => `- ${d.id}: ${d.titulo} (${d.tipo}). ${d.descripcion}` +
+    `${d.filtros.periodo ? ` Periodo por: ${d.filtros.periodo}.` : ' Sin periodo.'}${d.filtros.busqueda ? ` Búsqueda: ${d.filtros.busqueda}.` : ''}` +
+    `${d.filtros.estados ? ` ${d.filtros.etiquetaEstado || 'Estado'}: ${d.filtros.estados.join(' | ')}.` : ''}`).join('\n')
+  const esAdmin = req.usuario.nombre_rol === 'Administrador'
+  const sistema = `Eres el asistente de reportes de Directorio Servicios, SRL (Santiago, República Dominicana).
+El usuario es ${req.usuario.nombre} ${req.usuario.apellido}, rol ${req.usuario.nombre_rol === 'Empleado' ? 'Prestador' : req.usuario.nombre_rol}.
+Hoy es ${DIA_RD.format(new Date())} (${hoy}). La moneda es RD$.
+
+Ayudas de dos formas:
+1) Datos: para cualquier cifra, lista o resumen usa SIEMPRE la herramienta ejecutar_reporte con uno de estos reportes (son los únicos que puedes usar):
+${lista}
+2) Uso del sistema: explica paso a paso cómo hacer las tareas del rol con esta guía (no ejecutas acciones; indica la pantalla y los botones):
+${GUIA_ROL[req.usuario.nombre_rol] || ''}
+${esAdmin ? `3) Consulta libre (solo administrador): si NINGÚN reporte de la lista cubre lo pedido, usa la herramienta consulta_sql con UNA sola consulta
+SELECT de T-SQL (SQL Server 2022) sobre este esquema. Reglas: solo lectura; usa TOP 1000; pon alias de columna legibles en español entre corchetes
+(ej. [Monto total]); une las tablas por sus relaciones; filtra fechas con CAST(col AS date) BETWEEN 'yyyy-mm-dd' AND 'yyyy-mm-dd'; ordena el resultado.
+Si la consulta da error, corrígela y vuelve a intentarlo una vez. En los filtros usa solo los valores existentes que aparecen abajo.
+${NOTAS_ESQUEMA}
+Esquema:
+${await esquemaBD()}
+` : ''}
+Reglas:
+- Convierte el periodo pedido a fechas yyyy-mm-dd: "este mes" = del día 1 del mes actual a hoy; "el mes pasado" = mes anterior completo; "este año" = 1 de enero a hoy;
+  "hoy", "ayer", "esta semana" (lunes a hoy) igual. Si no dice periodo: en reportes usa este año; en consultas deja desde y hasta vacíos (todo).
+- Si el usuario pide un reporte, una lista, un historial o un documento, EJECÚTALO siempre con la herramienta; nunca le digas que lo busque
+  en el menú ni que no tienes acceso a sus datos: sus propios datos siempre están disponibles con la herramienta. Si el periodo es relativo
+  ("hace un mes", "la semana pasada", "en octubre") conviértelo a fechas; "hace un mes" = el mes calendario anterior completo.
+  El reporte completo se le muestra en pantalla (o se abre en PDF o se descarga en Excel según el formato), así que tu texto solo resume lo principal.
+- Puedes ejecutar hasta 3 reportes si la pregunta lo necesita (por ejemplo, para comparar dos meses).
+- Responde en español, breve y claro (2 a 6 oraciones), en texto plano sin markdown ni asteriscos. Da las cifras exactas del resultado con RD$ y separador de miles.
+- Si el resultado viene vacío, dilo y sugiere ampliar el periodo. Nunca inventes cifras: usa solo lo que devuelva la herramienta.
+- Si piden algo que ningún reporte cubre o datos de otros usuarios, explícalo y menciona los reportes que sí puedes preparar.
+- El usuario puede exportar a Excel o PDF desde la tarjeta del reporte; no hace falta que lo repitas cada vez.`
+
+  const herramienta = {
+    functionDeclarations: [{
+      name: 'ejecutar_reporte',
+      description: 'Ejecuta una consulta o reporte del sistema con los permisos del usuario y devuelve totales y filas.',
+      parameters: {
+        type: 'OBJECT',
+        properties: {
+          id: { type: 'STRING', enum: catalogo.map((d) => d.id), description: 'Identificador del reporte' },
+          desde: { type: 'STRING', description: 'Fecha inicial yyyy-mm-dd (vacío = sin límite)' },
+          hasta: { type: 'STRING', description: 'Fecha final yyyy-mm-dd (vacío = sin límite)' },
+          busqueda: { type: 'STRING', description: 'Texto a buscar, si el reporte admite búsqueda' },
+          estado: { type: 'STRING', description: 'Uno de los estados del reporte, si aplica' },
+          formato: { type: 'STRING', enum: ['pantalla', 'pdf', 'excel'],
+            description: 'pdf si el usuario pide PDF, imprimir o un documento; excel si pide Excel, hoja de cálculo o descargar; pantalla en otro caso' },
+        },
+        required: ['id'],
+      },
+    }, ...(esAdmin ? [{
+      name: 'consulta_sql',
+      description: 'Solo si ningún reporte cubre lo pedido: ejecuta una consulta SELECT de solo lectura sobre la base de datos y devuelve las filas.',
+      parameters: {
+        type: 'OBJECT',
+        properties: {
+          sql: { type: 'STRING', description: 'Una sola consulta SELECT de T-SQL con TOP 1000 y alias legibles en español' },
+          titulo: { type: 'STRING', description: 'Título corto del reporte en español' },
+          formato: { type: 'STRING', enum: ['pantalla', 'pdf', 'excel'], description: 'Igual que en ejecutar_reporte' },
+        },
+        required: ['sql', 'titulo'],
+      },
+    }] : [])],
+  }
+  const historial = (Array.isArray(historialEntrada) ? historialEntrada : []).slice(-6)
+    .filter((m) => m && ['user', 'model'].includes(m.rol) && typeof m.texto === 'string')
+    .map((m) => ({ role: m.rol, parts: [{ text: m.texto.slice(0, 1500) }] }))
+  const contents = [...historial, { role: 'user', parts: [{ text: pregunta }] }]
+  const tarjetas = []
+  let tokens = 0
+
+  for (let paso = 0; paso < 4; paso++) {
+    const d = await llamarGemini({
+      systemInstruction: { parts: [{ text: sistema }] },
+      contents, tools: [herramienta],
+      toolConfig: { functionCallingConfig: { mode: 'AUTO' } },
+      generationConfig: { thinkingConfig: { thinkingLevel: 'low' }, maxOutputTokens: 1500 },
+    })
+    if (!d) return { ...(await reporteLocal(pregunta, req.usuario, catalogo)), modo: 'local', aviso: 'La IA no respondió; se eligió el reporte más parecido a tu pedido.' }
+    tokens += d.usageMetadata?.totalTokenCount || 0
+    const contenido = d.candidates?.[0]?.content
+    const llamadas = (contenido?.parts || []).filter((p) => p.functionCall)
+    if (!llamadas.length || paso === 3) {
+      const texto = (contenido?.parts || []).filter((p) => p.text && !p.thought).map((p) => p.text).join('').trim()
+      return { respuesta: texto || (tarjetas.length ? 'Aquí tienes el resultado.' : 'No pude preparar ese reporte. ¿Puedes darme más detalles?'), reportes: tarjetas, modo: 'gemini', tokens }
+    }
+    // Se devuelve el turno del modelo tal cual (conserva sus firmas de razonamiento) y luego los resultados
+    contents.push(contenido)
+    const respuestas = []
+    for (const { functionCall: fc } of llamadas) {
+      const a = fc.args || {}
+      let resultado
+      if (fc.name === 'consulta_sql') {
+        const formato = ['pdf', 'excel'].includes(a.formato) ? a.formato : 'pantalla'
+        const problema = !esAdmin ? 'Solo el administrador puede hacer consultas libres' : validarSql(a.sql)
+        if (problema) resultado = { error: problema }
+        else {
+          try {
+            // Se quitan del resultado las columnas sensibles (p. ej. si la consulta usó SELECT *)
+            const filas = (await consultaSoloLectura(String(a.sql).trim().replace(/;\s*$/, ''))).map((f) => Object.fromEntries(
+              Object.entries(f).filter(([k, v]) => !COLUMNAS_OCULTAS.includes(k) && !/hash|token|contrasena|password/i.test(k) && !(typeof v === 'string' && /^\$2[aby]\$/.test(v)))
+                .map(([k, v]) => [k, traducir(v)])))
+            const t = tarjetaConsulta(filas, a.titulo, a.sql, formato)
+            const valor = (v) => (v instanceof Date ? v.toISOString().slice(0, 16).replace('T', ' ') : v)
+            resultado = { total_filas: filas.length, resumen: Object.fromEntries(t.resumen.map((x) => [x.t, x.v])),
+              filas: filas.slice(0, 25).map((f) => Object.fromEntries(Object.entries(f).map(([k, v]) => [k, valor(v)]))) }
+            const vacia = tarjetas.findIndex((x) => x.dinamico && !x.total_filas)
+            if (vacia >= 0) tarjetas[vacia] = t
+            else if (tarjetas.length < 3) tarjetas.push(t)
+            await auditarIA(req, a.sql, filas.length)
+          } catch (e) {
+            resultado = { error: `Error de SQL: ${String(e.message).slice(0, 300)}` }
+          }
+        }
+        respuestas.push({ functionResponse: { name: 'consulta_sql', response: resultado } })
+        continue
+      }
+      try {
+        const r = await ejecutarReporte(a.id, req.usuario, { desde: a.desde, hasta: a.hasta, q: a.busqueda, estado: a.estado })
+        if (!r) resultado = { error: 'Reporte no disponible para este usuario' }
+        else {
+          resultado = resultadoParaIA(r, r.def)
+          // Si la IA repite un reporte porque el intento anterior salió vacío (ajustó un filtro), el nuevo lo reemplaza
+          const t = tarjetaReporte(r, r.def, ['pdf', 'excel'].includes(a.formato) ? a.formato : 'pantalla')
+          const vacia = tarjetas.findIndex((x) => x.id === t.id && !x.total_filas)
+          if (vacia >= 0) tarjetas[vacia] = t
+          else if (tarjetas.length < 3) tarjetas.push(t)
+        }
+      } catch (e) {
+        console.error('[IA reportes] ejecutar', a.id, e.message)
+        resultado = { error: 'No se pudo ejecutar el reporte' }
+      }
+      respuestas.push({ functionResponse: { name: 'ejecutar_reporte', response: resultado } })
+    }
+    contents.push({ role: 'user', parts: respuestas })
+  }
+}
+
 // ---------- Rutas del módulo (montadas en /api) ----------
 export const router = Router()
+router.use('/ia/reportes', rIaReportes) // va antes de /ia: ese router es solo para clientes
 router.use('/ia', rIa)
 router.use('/admin/ia', rAdminIa)

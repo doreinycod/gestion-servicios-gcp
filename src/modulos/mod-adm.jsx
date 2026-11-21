@@ -1,6 +1,6 @@
 // MOD-ADM · Administración
 // ADM-P01 Acceso y registro · Mi perfil · ADM-P02 Dashboard · ADM-P03 Aprobación de prestadores · ADM-P04 Usuarios y roles · ADM-P05 Reportes · Configuración
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { useSession, CUENTAS_DEMO, INICIO_POR_ROL } from '../components/session'
 import { get, leerSesion, patch, post } from '../lib/api'
@@ -8,8 +8,8 @@ import { useApi } from '../lib/useApi'
 import { Brand, Page } from '../components/Layout'
 import { emailValido, cedulaValida, rncValido, telefonoValido, contrasenaValida, fortaleza } from '../lib/fiscal'
 import { Field, Avatar, Badge, Chips, Kpi, PasswordInput } from '../components/ui'
-import { usuarios, permisos, reporteIngresos } from '../data/mock'
-import { num, num0, money0, hace, formatoCedula } from '../lib/format'
+import { usuarios, permisos } from '../data/mock'
+import { num, num0, money, money0, hace, formatoCedula, dia, fechaHora, isoDia } from '../lib/format'
 import { letras, textoSinNumeros, cedula, rncCedula, telefono, nombreValido, soloLetras, soloTextoSinNumeros, soloEntero, soloDecimal, soloTelefono, soloRncCedula } from '../lib/filtros'
 
 // ADM-P01 · Pantalla de inicio de sesión (Figura 30)
@@ -724,51 +724,469 @@ export function Usuarios() {
   )
 }
 
-// ADM-P05 · Reportes (Figura 52)
-const REPORTES = ['Ingresos por periodo', 'Solicitudes por estado', 'Servicios más solicitados', 'Desempeño de prestadores', 'Pagos por método', 'Comprobantes e-CF emitidos (607)', 'Uso del asistente IA']
+// ADM-P05 · Consultas y reportes (Figura 52). Una sola pantalla para los tres roles:
+// el servidor solo entrega las definiciones del rol y limita los datos al usuario conectado.
+const PERIODOS_REP = ['Hoy', '7 días', 'Este mes', 'Este año', 'Próximos 7 días', 'Todo', 'Rango']
+const MES_REP = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic']
 
-export function Reportes() {
-  const [tipo, setTipo] = useState(REPORTES[0])
-  const r = reporteIngresos
+/** Fechas desde/hasta (yyyy-mm-dd) de un periodo predefinido. */
+function rangoPeriodo(clave) {
+  const hoy = new Date()
+  const d = (dias) => isoDia(new Date(hoy.getTime() + dias * 864e5))
+  switch (clave) {
+    case 'Hoy': return { desde: d(0), hasta: d(0) }
+    case '7 días': return { desde: d(-6), hasta: d(0) }
+    case 'Este mes': return { desde: `${d(0).slice(0, 8)}01`, hasta: d(0) }
+    case 'Este año': return { desde: `${hoy.getFullYear()}-01-01`, hasta: d(0) }
+    case 'Próximos 7 días': return { desde: d(0), hasta: d(6) }
+    default: return { desde: '', hasta: '' } // Todo
+  }
+}
+const periodoInicial = (def) => (def?.periodoInicial === '7d+' ? 'Próximos 7 días' : def?.tipo === 'reporte' ? 'Este año' : 'Todo')
+const textoMes = (v) => (/^\d{4}-\d{2}$/.test(String(v)) ? `${MES_REP[Number(v.slice(5)) - 1]} ${v.slice(0, 4)}` : v)
+
+/** Valor formateado según el tipo de columna. */
+function celda(valor, f) {
+  if (valor === null || valor === undefined || valor === '') return '—'
+  switch (f) {
+    case 'dinero': return money(valor)
+    case 'numero': return num0(valor)
+    case 'pct': return `${num(valor)} %`
+    case 'fecha': return dia(String(valor).slice(0, 10))
+    case 'fechahora': return fechaHora(valor)
+    case 'estrellas': return Number(valor) ? `★ ${Number(valor).toFixed(1)}` : '—'
+    case 'estado': return <Badge>{valor}</Badge>
+    default: return textoMes(valor)
+  }
+}
+
+/** Gráfica de barras de la columna indicada (agrupa por la columna x si se pide). */
+function GraficoReporte({ g, filas }) {
+  let datos = filas.map((f) => ({ x: textoMes(f[g.x]), y: Number(f[g.y] || 0) }))
+  if (g.agrupar) {
+    const m = new Map()
+    for (const d of datos) m.set(d.x, (m.get(d.x) || 0) + d.y)
+    datos = [...m].map(([x, y]) => ({ x, y }))
+  }
+  if (g.limite) datos = [...datos].sort((a, b) => b.y - a.y).slice(0, g.limite)
+  if (!datos.length) return null
+  const max = Math.max(...datos.map((d) => d.y), 1)
+  const etiqueta = (v) => (g.f === 'dinero' ? (v >= 1000 ? `${(v / 1000).toFixed(1)} k` : num0(v)) : g.f === 'pct' ? `${Math.round(v)}%` : num0(v))
   return (
-    <Page crumb="Administración · Reportes" title="Reportes">
-      <div className="split" style={{ gridTemplateColumns: '260px minmax(0,1fr)' }}>
-        <div className="card col" style={{ gap: 8 }}>
-          <div className="card-title" style={{ margin: 0 }}>Tipo de reporte</div>
-          {REPORTES.map((t) => (
-            <label key={t} className={`option-card ${tipo === t ? 'selected' : ''}`} style={{ alignItems: 'center' }}>
-              <input type="radio" checked={tipo === t} onChange={() => setTipo(t)} /><span className="small">{t}</span>
-            </label>
+    <div className="card mb-16">
+      <div className="bars" style={{ height: 170 }}>
+        {datos.map((d, i) => (
+          <div key={`${d.x}${i}`} className="b" title={`${d.x}: ${g.f === 'dinero' ? money(d.y) : etiqueta(d.y)}`}>
+            <span className="xs muted">{etiqueta(d.y)}</span>
+            <div style={{ height: `${Math.max((d.y / max) * 85, d.y ? 2 : 0)}%` }} />
+          </div>
+        ))}
+      </div>
+      <div className="bars-x">{datos.map((d, i) => <span key={`${d.x}${i}`} title={d.x}>{String(d.x).length > 14 ? `${String(d.x).slice(0, 13)}…` : d.x}</span>)}</div>
+    </div>
+  )
+}
+
+/** Descarga el CSV (Excel) de un reporte con sus filtros. */
+// eslint-disable-next-line react-refresh/only-export-components
+export async function descargarCsv(id, filtros, titulo) {
+  const r = await fetch(`/api/reportes/${id}?${new URLSearchParams({ ...filtros, formato: 'csv' })}`, { headers: { Authorization: `Bearer ${leerSesion()?.token}` } })
+  if (!r.ok) throw new Error('No se pudo exportar el reporte')
+  const url = URL.createObjectURL(await r.blob())
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${titulo.replace(/[^\wáéíóúñ ]/gi, '').replace(/\s+/g, '_')}_${filtros.desde || 'todo'}_${filtros.hasta || ''}.csv`
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+/** CSV (Excel) armado en el navegador con el resultado de una consulta libre de la IA. */
+function descargarCsvDeFilas(titulo, columnas, filas) {
+  const esc = (v) => {
+    const t = v === null || v === undefined ? '' : String(v)
+    return /[",;\r\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t
+  }
+  const lineas = [columnas.map((c) => esc(c.t)).join(','), ...filas.map((f) => columnas.map((c) => esc(f[c.k])).join(','))]
+  const url = URL.createObjectURL(new Blob([`\uFEFF${lineas.join('\r\n')}`], { type: 'text/csv;charset=utf-8' }))
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${titulo.replace(/[^\wáéíóúñ ]/gi, '').replace(/\s+/g, '_') || 'reporte'}.csv`
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+/** Imprime (Guardar como PDF) solo la tarjeta indicada, con todas sus filas. */
+function imprimirTarjeta(elemento) {
+  if (!elemento) return
+  elemento.classList.add('tarjeta-a-imprimir')
+  document.body.classList.add('imprimiendo-tarjeta')
+  const limpiar = () => {
+    elemento.classList.remove('tarjeta-a-imprimir')
+    document.body.classList.remove('imprimiendo-tarjeta')
+    window.removeEventListener('afterprint', limpiar)
+  }
+  window.addEventListener('afterprint', limpiar)
+  setTimeout(() => window.print(), 100)
+}
+
+const EJEMPLOS_IA = {
+  Administrador: ['¿Cuánto vendimos por PayPal este mes?', '¿Qué prestador completó más servicios este año?', 'Compara los ingresos de este mes con el mes pasado',
+    'Dame el 607 del mes pasado', '¿Hay solicitudes sin prestador?', '¿Cómo apruebo a un prestador nuevo?'],
+  Empleado: ['¿Qué citas tengo esta semana?', '¿Cuánto gané este mes después de la comisión?', '¿Cuál es mi calificación promedio?',
+    '¿Cómo cobro un anticipo en efectivo?', '¿Cómo le pido un cargo adicional a un cliente?'],
+  Cliente: ['¿Cuánto ITBIS me facturaron este año?', '¿Cuánto he pagado este mes?', '¿Cuánto me ha ahorrado mi plan?'],
+}
+
+// La conversación se conserva mientras la sesión del navegador esté abierta (aunque cambie de pantalla)
+const CLAVE_CHAT = (rol) => `gs_chat_ia_${rol}`
+const leerChat = (rol) => { try { return JSON.parse(sessionStorage.getItem(CLAVE_CHAT(rol))) || [] } catch { return [] } }
+
+/**
+ * IA-P03 · Asistente del administrador y del prestador: pide consultas y reportes en lenguaje natural
+ * (la IA elige el reporte, aplica filtros y lo resume) y responde cómo usar el sistema.
+ * completo = pantalla del menú "Asistente IA"; si no, recuadro dentro de "Consultas y reportes".
+ */
+export function AsistenteReportes({ rol, onAbrir, completo = false }) {
+  const [abierto, setAbierto] = useState(true)
+  const [texto, setTexto] = useState('')
+  const [mensajes, setMensajes] = useState(() => leerChat(rol)) // { rol: 'user' | 'model', texto, reportes? }
+  const [pensando, setPensando] = useState(false)
+  const [error, setError] = useState('')
+  const [imprimirAhora, setImprimirAhora] = useState(null) // tarjeta de consulta libre que se imprime al aparecer
+  const fin = useRef(null)
+  useEffect(() => {
+    try { sessionStorage.setItem(CLAVE_CHAT(rol), JSON.stringify(mensajes.slice(-30))) } catch { /* sin almacenamiento: solo en memoria */ }
+    if (completo) fin.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+  }, [mensajes, rol, completo])
+
+  const preguntar = async (t) => {
+    const pregunta = (t ?? texto).trim()
+    if (!pregunta || pensando) return
+    setError('')
+    setTexto('')
+    const historial = mensajes.map((m) => ({ rol: m.rol, texto: m.texto }))
+    setMensajes((m) => [...m, { rol: 'user', texto: pregunta }])
+    setPensando(true)
+    try {
+      const r = await post('/ia/reportes', { pregunta, historial })
+      setMensajes((m) => [...m, { rol: 'model', texto: r.respuesta, reportes: r.reportes || [], aviso: r.aviso }])
+      // Si pidió el documento, se genera de una vez: Excel se descarga y PDF abre la vista de impresión
+      const conDatos = (r.reportes || []).filter((x) => x.total_filas)
+      for (const x of conDatos.filter((x) => x.formato === 'excel')) {
+        if (x.dinamico) descargarCsvDeFilas(x.titulo, x.columnas, x.filas)
+        else await descargarCsv(x.id, { desde: x.desde, hasta: x.hasta, q: x.q, estado: x.estado }, x.titulo).catch(() => {})
+      }
+      const pdf = conDatos.find((x) => x.formato === 'pdf')
+      if (pdf?.dinamico) setImprimirAhora(pdf)
+      else if (pdf) onAbrir(pdf, { imprimir: true })
+    } catch (e) {
+      setError(e.message)
+      setMensajes((m) => m.slice(0, -1))
+      setTexto(pregunta)
+    } finally {
+      setPensando(false)
+    }
+  }
+
+  return (
+    <div className={`card no-imprimir ${completo ? 'chat' : 'mb-16'}`} style={completo ? { padding: 0 } : { border: '1.5px solid var(--green-200)' }}>
+      <div className="row between" style={completo ? { padding: '12px 16px', borderBottom: '1px solid var(--border)' } : undefined}>
+        <div className="row" style={{ gap: 8 }}>
+          {completo ? <div className="avatar" style={{ background: 'var(--green-600)' }}>🤖</div> : <span style={{ fontSize: 20 }}>🤖</span>}
+          <div>
+            <b>{completo ? 'Asistente Directorio' : 'Pídele un reporte a la IA'}</b>
+            <div className="xs muted">{completo
+              ? <span className="green">● {pensando ? 'Preparando la respuesta…' : 'En línea'}</span>
+              : 'Escribe lo que necesitas: la IA elige el reporte, aplica los filtros y te explica el resultado.'}</div>
+          </div>
+        </div>
+        <div className="row">
+          {mensajes.length > 0 && <button className="link-btn xs" onClick={() => setMensajes([])}>{completo ? 'Nueva conversación' : 'Limpiar'}</button>}
+          {!completo && <button className="link-btn xs" onClick={() => setAbierto(!abierto)}>{abierto ? 'Ocultar' : 'Mostrar'}</button>}
+        </div>
+      </div>
+      {(abierto || completo) && (
+        <>
+          {completo && (
+            <div className="chat-body">
+              <div className="msg bot">
+                ¡Hola! 👋 Soy tu asistente. Pídeme cualquier cifra o reporte ("¿cuánto vendimos este mes?") y te lo preparo con los datos del sistema,
+                o pregúntame cómo hacer algo en la plataforma.
+              </div>
+              {!mensajes.length && (
+                <div className="row wrap" style={{ gap: 6 }}>
+                  {(EJEMPLOS_IA[rol] || []).map((e) => <button key={e} className="chip" onClick={() => preguntar(e)}>{e}</button>)}
+                </div>
+              )}
+              {mensajes.map((m, i) => (
+                <div key={i} className={`msg ${m.rol === 'user' ? 'me' : 'bot'}`} style={{ maxWidth: m.rol === 'user' ? '72%' : '92%', whiteSpace: 'pre-wrap' }}>
+                  {m.texto}
+                  {m.aviso && <div className="xs muted mt-8">{m.aviso}</div>}
+                  {m.reportes?.map((r, j) => <TarjetaReporteIA key={j} r={r} onAbrir={onAbrir} imprimir={imprimirAhora === r} onImpreso={() => setImprimirAhora(null)} />)}
+                </div>
+              ))}
+              {pensando && <div className="msg bot muted"><span className="typing">●●●</span></div>}
+              <div ref={fin} />
+            </div>
+          )}
+          {!completo && mensajes.length > 0 && (
+            <div className="col mt-12" style={{ gap: 10, maxHeight: 520, overflowY: 'auto' }}>
+              {mensajes.map((m, i) => (
+                <div key={i} className={`msg ${m.rol === 'user' ? 'me' : 'bot'}`} style={{ maxWidth: m.rol === 'user' ? '72%' : '100%', whiteSpace: 'pre-wrap' }}>
+                  {m.texto}
+                  {m.aviso && <div className="xs muted mt-8">{m.aviso}</div>}
+                  {m.reportes?.map((r, j) => <TarjetaReporteIA key={j} r={r} onAbrir={onAbrir} imprimir={imprimirAhora === r} onImpreso={() => setImprimirAhora(null)} />)}
+                </div>
+              ))}
+              {pensando && <div className="msg bot muted"><span className="typing">●●●</span> Preparando el reporte…</div>}
+            </div>
+          )}
+          {!completo && !mensajes.length && (
+            <div className="row wrap mt-12" style={{ gap: 6 }}>
+              {(EJEMPLOS_IA[rol] || []).map((e) => <button key={e} className="chip" onClick={() => preguntar(e)}>{e}</button>)}
+            </div>
+          )}
+          {error && <div className="alert alert-err small" style={{ margin: completo ? '0 12px 8px' : '8px 0 0' }}>{error}</div>}
+          <form className={`row ${completo ? '' : 'mt-12'}`} style={completo ? { padding: 12, borderTop: '1px solid var(--border)' } : undefined} onSubmit={(e) => { e.preventDefault(); preguntar() }}>
+            <input className="input" maxLength={600} autoFocus={completo} placeholder={completo ? 'Escribe tu pregunta o pide un reporte…' : 'Ej.: "¿Cuánto facturamos el mes pasado por servicio?"'}
+              value={texto} disabled={pensando} onChange={(e) => setTexto(e.target.value)} />
+            <button className="btn btn-primary" disabled={pensando || !texto.trim()}>{pensando ? '…' : completo ? 'Enviar' : 'Preguntar'}</button>
+          </form>
+        </>
+      )}
+    </div>
+  )
+}
+
+/** Resultado de un reporte dentro del chat: totales, primeras filas y acciones. */
+export function TarjetaReporteIA({ r, onAbrir, imprimir = false, onImpreso }) {
+  const [exportando, setExportando] = useState(false)
+  const [verSql, setVerSql] = useState(false)
+  const tarjeta = useRef(null)
+  const columnas = r.columnas
+  const filtros = { desde: r.desde, hasta: r.hasta, q: r.q, estado: r.estado }
+  useEffect(() => {
+    if (!imprimir) return
+    imprimirTarjeta(tarjeta.current)
+    onImpreso?.()
+  }, [imprimir, onImpreso])
+  const pdf = () => (r.dinamico ? imprimirTarjeta(tarjeta.current) : onAbrir(r, { imprimir: true }))
+  const excel = async () => {
+    if (r.dinamico) return descargarCsvDeFilas(r.titulo, columnas, r.filas)
+    setExportando(true)
+    try { await descargarCsv(r.id, filtros, r.titulo) } catch (e) { window.alert(e.message) } finally { setExportando(false) }
+  }
+  return (
+    <div ref={tarjeta} className="card mt-8" style={{ background: '#fff', padding: 12, whiteSpace: 'normal' }}>
+      <div className="solo-imprimir small" style={{ marginBottom: 6 }}><b>Directorio Servicios, SRL</b> · Reporte generado por el asistente IA · {fechaHora(new Date().toISOString())}</div>
+      <div className="row between wrap">
+        <b className="small">📄 Reporte: {r.icono} {r.titulo}</b>
+        <span className="xs muted">{r.dinamico ? 'Consulta a la base de datos' : r.desde ? `${dia(r.desde)} al ${dia(r.hasta)}` : 'Todo el historial'}{r.q ? ` · "${r.q}"` : ''}{r.estado ? ` · ${r.estado}` : ''} · {num0(r.total_filas)} resultado{r.total_filas === 1 ? '' : 's'}</span>
+      </div>
+      {r.resumen.length > 0 && (
+        <div className="row wrap mt-8" style={{ gap: 14 }}>
+          {r.resumen.map((x) => (
+            <div key={x.t}><div className="xs muted">{x.t}</div><b className="small">{x.f === 'dinero' ? money(x.v) : x.f === 'pct' ? `${num(x.v)} %` : x.f === 'estrellas' ? `★ ${Number(x.v).toFixed(1)}` : typeof x.v === 'number' ? num0(x.v) : x.v}</b></div>
           ))}
         </div>
-        <div className="col" style={{ gap: 16 }}>
-          <div className="card row wrap" style={{ alignItems: 'flex-end' }}>
-            <Field label="Desde"><input className="input" type="date" defaultValue="2026-09-01" /></Field>
-            <Field label="Hasta"><input className="input" type="date" defaultValue="2026-09-30" /></Field>
-            <Field label="Categoría"><select className="select"><option>Todas</option><option>Técnicos</option><option>Profesionales</option><option>Hogar</option></select></Field>
-            <Field label="Método de pago"><select className="select"><option>Todos</option><option>PayPal</option><option>Tarjeta</option><option>Transferencia</option><option>Efectivo</option></select></Field>
-            <button className="btn btn-primary">Generar</button>
-            <div className="row" style={{ marginLeft: 'auto' }}>
-              <button className="btn btn-outline btn-sm">⬇ PDF</button><button className="btn btn-outline btn-sm">⬇ Excel</button><button className="btn btn-ghost btn-sm" onClick={() => window.print()}>🖨</button>
-            </div>
-          </div>
-          <div className="card">
-            <div className="bold" style={{ fontSize: 15 }}>Reporte de {tipo.toLowerCase()}</div>
-            <div className="xs muted mb-12">Directorio Servicios, SRL · 01/09/2026 – 30/09/2026 · Generado por Ana Díaz</div>
-            <div className="table-wrap">
-              <table className="table">
-                <thead><tr><th>Categoría</th><th className="num">Solicitudes pagadas</th><th className="num">Subtotal</th><th className="num">ITBIS</th><th className="num">Total</th><th className="num">% del total</th></tr></thead>
-                <tbody>{r.categorias.map((c) => <tr key={c.cat}><td>{c.cat}</td><td className="num">{c.n}</td><td className="num">{num(c.sub)}</td><td className="num">{num(c.itbis)}</td><td className="num">{num(c.total)}</td><td className="num">{c.pct}</td></tr>)}</tbody>
-                <tfoot><tr><td>TOTAL</td><td className="num">{r.total.n}</td><td className="num">{num(r.total.sub)}</td><td className="num">{num(r.total.itbis)}</td><td className="num">{num(r.total.total)}</td><td className="num">100%</td></tr></tfoot>
-              </table>
-            </div>
-            <div className="semibold mt-16 mb-8">Por método de pago</div>
-            <table className="table">
-              <thead><tr><th>Método</th><th className="num">Pagos</th><th className="num">Monto</th></tr></thead>
-              <tbody>{r.metodos.map((m) => <tr key={m.m}><td>{m.m}</td><td className="num">{m.n}</td><td className="num">{num(m.monto)}</td></tr>)}</tbody>
-            </table>
-          </div>
+      )}
+      {r.filas.length > 0 && (
+        <div className="table-wrap tabla-ia mt-8" style={{ maxHeight: 380, overflowY: 'auto', border: '1px solid var(--border)', borderRadius: 8 }}>
+          <table className="table" style={{ fontSize: 11.5 }}>
+            <thead style={{ position: 'sticky', top: 0, background: '#f4f7f5', zIndex: 1 }}>
+              <tr>{columnas.map((c) => <th key={c.k} className={['dinero', 'numero', 'pct'].includes(c.f) ? 'num' : ''}>{c.t}</th>)}</tr>
+            </thead>
+            <tbody>{r.filas.map((f, i) => <tr key={i}>{columnas.map((c) => <td key={c.k} className={['dinero', 'numero', 'pct'].includes(c.f) ? 'num' : ''}>{celda(f[c.k], c.f)}</td>)}</tr>)}</tbody>
+          </table>
         </div>
+      )}
+      {r.total_filas > r.filas.length && <div className="xs muted mt-8">Se muestran {r.filas.length} de {num0(r.total_filas)} filas; el PDF y el Excel incluyen todas.</div>}
+      {r.formato === 'pdf' && <div className="xs green mt-8 no-imprimir">✓ Se abrió la vista de impresión: elige "Guardar como PDF".</div>}
+      {r.formato === 'excel' && <div className="xs green mt-8 no-imprimir">✓ Se descargó el archivo de Excel.</div>}
+      <div className="row mt-8 no-imprimir" style={{ gap: 6 }}>
+        {!r.dinamico && <button className="btn btn-primary btn-sm" onClick={() => onAbrir(r)}>Abrir reporte completo</button>}
+        <button className="btn btn-outline btn-sm" disabled={exportando || !r.total_filas} onClick={excel}>{exportando ? 'Exportando…' : '⬇ Excel'}</button>
+        <button className="btn btn-outline btn-sm" disabled={!r.total_filas} onClick={pdf}>🖨 PDF</button>
+        {r.sql && <button className="link-btn xs" onClick={() => setVerSql(!verSql)}>{verSql ? 'Ocultar consulta' : 'Ver consulta'}</button>}
+      </div>
+      {verSql && <pre className="xs mt-8 no-imprimir" style={{ whiteSpace: 'pre-wrap', background: '#f4f7f5', padding: 8, borderRadius: 6, margin: 0 }}>{r.sql}</pre>}
+    </div>
+  )
+}
+
+/** Lista de consultas o de reportes en la columna izquierda. */
+function GrupoReportes({ titulo, items, activo, onElegir }) {
+  return (
+    <>
+      <div className="label mt-12 mb-8">{titulo} ({items.length})</div>
+      {items.map((r) => (
+        <button key={r.id} className={`nav-item small ${activo === r.id ? 'active-rep' : ''}`} style={{ color: 'var(--text)', width: '100%', textAlign: 'left' }} onClick={() => onElegir(r)}>
+          <span className="nav-icon">{r.icono}</span>{r.titulo}
+        </button>
+      ))}
+    </>
+  )
+}
+
+export function Reportes() {
+  const navigate = useNavigate()
+  const { usuario } = useSession()
+  const catalogo = useApi('/reportes')
+  const [params, setParams] = useSearchParams()
+  const lista = catalogo.data || []
+  const def = lista.find((r) => r.id === params.get('r')) || lista[0] || null
+
+  // Filtros iniciales: los que vienen en la URL cuando se abre desde el Asistente IA
+  const [periodo, setPeriodo] = useState(() => (params.get('desde') ? 'Rango' : params.has('r') && params.has('desde') ? 'Todo' : null)) // null = el inicial del reporte
+  const [rango, setRango] = useState(() => ({ desde: params.get('desde') || '', hasta: params.get('hasta') || '' }))
+  const [busqueda, setBusqueda] = useState(() => params.get('q') || '')
+  const [q, setQ] = useState(() => params.get('q') || '')
+  const [estado, setEstado] = useState(() => params.get('estado') || '')
+  const [descargando, setDescargando] = useState(false)
+  const espera = useRef(null)
+
+  const periodoActual = periodo || periodoInicial(def)
+  const fechas = periodoActual === 'Rango' ? rango : rangoPeriodo(periodoActual)
+  const consulta = def ? `/reportes/${def.id}?${new URLSearchParams({ desde: fechas.desde, hasta: fechas.hasta, q, estado })}` : null
+  const datos = useApi(consulta)
+  const filas = datos.data?.filas || []
+  const impreso = useRef(false)
+  useEffect(() => {
+    if (params.get('imprimir') !== '1' || impreso.current || !datos.data || datos.cargando) return
+    // deja que se dibujen la tabla y la gráfica; se marca al imprimir (en desarrollo el efecto corre dos veces)
+    const t = setTimeout(() => { impreso.current = true; window.print() }, 500)
+    return () => clearTimeout(t)
+  }, [params, datos.data, datos.cargando])
+
+  const elegir = (r) => {
+    setParams({ r: r.id })
+    setPeriodo(null)
+    setBusqueda('')
+    setQ('')
+    setEstado('')
+  }
+  const abrirDesdeIA = (r, opciones = {}) => {
+    impreso.current = false
+    setParams({ r: r.id, ...(opciones.imprimir ? { imprimir: '1' } : {}) })
+    if (r.desde) { setPeriodo('Rango'); setRango({ desde: r.desde, hasta: r.hasta }) } else setPeriodo('Todo')
+    setBusqueda(r.q || '')
+    setQ(r.q || '')
+    setEstado(r.estado || '')
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  }
+  const escribir = (v) => {
+    setBusqueda(v)
+    clearTimeout(espera.current)
+    espera.current = setTimeout(() => setQ(v.trim()), 400)
+  }
+  const exportarExcel = async () => {
+    setDescargando(true)
+    try {
+      await descargarCsv(def.id, { desde: fechas.desde, hasta: fechas.hasta, q, estado }, def.titulo)
+    } catch {
+      window.alert('No se pudo exportar el reporte')
+    } finally {
+      setDescargando(false)
+    }
+  }
+
+  const consultas = lista.filter((r) => r.tipo === 'consulta')
+  const reportes = lista.filter((r) => r.tipo === 'reporte')
+  return (
+    <Page crumb={`${usuario?.rol === 'Administrador' ? 'Administración' : usuario?.rol === 'Empleado' ? 'Prestador' : 'Inicio'} · Consultas y reportes`} title="Consultas y reportes">
+      <AsistenteReportes rol={usuario?.rol} onAbrir={abrirDesdeIA} />
+      <div className="split reportes" style={{ gridTemplateColumns: '270px minmax(0,1fr)' }}>
+        <div className="card no-imprimir" style={{ alignSelf: 'flex-start' }}>
+          <div className="xs muted">Consulta: buscar y ver datos puntuales. Reporte: totales y gráficas de un periodo, para exportar.</div>
+          {catalogo.error && <div className="alert alert-err small mt-8">{catalogo.error.message}</div>}
+          <GrupoReportes titulo="🔎 Consultas" items={consultas} activo={def?.id} onElegir={elegir} />
+          <GrupoReportes titulo="📊 Reportes" items={reportes} activo={def?.id} onElegir={elegir} />
+        </div>
+
+        {def ? (
+          <div className="col" style={{ gap: 16, minWidth: 0 }}>
+            <div className="card">
+              <div className="row between wrap" style={{ alignItems: 'flex-start' }}>
+                <div>
+                  <div className="row" style={{ gap: 8 }}><span style={{ fontSize: 20 }}>{def.icono}</span><b style={{ fontSize: 17 }}>{def.titulo}</b><Badge color={def.tipo === 'reporte' ? 'blue' : 'gray'}>{def.tipo === 'reporte' ? 'Reporte' : 'Consulta'}</Badge></div>
+                  <div className="small muted mt-8">{def.descripcion}</div>
+                  <div className="small solo-imprimir" style={{ marginTop: 6, borderTop: '1px solid #ddd', paddingTop: 6 }}>
+                    <b>Directorio Servicios, SRL</b> · {def.tipo === 'reporte' ? 'Reporte' : 'Consulta'}<br />
+                    <b>Filtros:</b> {def.filtros.periodo ? `${def.filtros.periodo}: ${fechas.desde ? `${dia(fechas.desde)} al ${dia(fechas.hasta)}` : 'todo el historial'}` : 'sin periodo'}
+                    {q ? ` · Búsqueda: "${q}"` : ''}{def.filtros.estados ? ` · ${def.filtros.etiquetaEstado || 'Estado'}: ${estado || 'todos'}` : ''}
+                    {' '}· {num0(filas.length)} resultado{filas.length === 1 ? '' : 's'}<br />
+                    <b>Generado por</b> {datos.data?.generado_por} el {datos.data ? fechaHora(datos.data.generado) : ''}
+                  </div>
+                </div>
+                <div className="row no-imprimir">
+                  <button className="btn btn-outline btn-sm" disabled={descargando || !filas.length} onClick={exportarExcel}>{descargando ? 'Exportando…' : '⬇ Excel'}</button>
+                  <button className="btn btn-outline btn-sm" disabled={!filas.length} onClick={() => window.print()}>🖨 PDF</button>
+                  <button className="btn btn-ghost btn-sm" onClick={datos.recargar} title="Actualizar">↻</button>
+                </div>
+              </div>
+
+              <div className="no-imprimir mt-12">
+                {def.filtros.periodo && (
+                  <div className="row wrap" style={{ gap: 8 }}>
+                    <span className="xs muted">{def.filtros.periodo}:</span>
+                    <Chips valor={periodoActual} onChange={(p) => { setPeriodo(p); if (p === 'Rango' && !rango.desde) setRango(rangoPeriodo('Este mes')) }}
+                      opciones={PERIODOS_REP.filter((p) => p !== 'Próximos 7 días' || def.periodoInicial === '7d+')} />
+                    {periodoActual === 'Rango' && (
+                      <>
+                        <input className="input" type="date" style={{ width: 150 }} value={rango.desde} onChange={(e) => setRango({ ...rango, desde: e.target.value })} />
+                        <span className="xs muted">al</span>
+                        <input className="input" type="date" style={{ width: 150 }} value={rango.hasta} onChange={(e) => setRango({ ...rango, hasta: e.target.value })} />
+                      </>
+                    )}
+                  </div>
+                )}
+                {(def.filtros.busqueda || def.filtros.estados) && (
+                  <div className="row wrap mt-8" style={{ gap: 8 }}>
+                    {def.filtros.busqueda && (
+                      <input className="input" style={{ maxWidth: 320 }} type="search" placeholder={`🔍 ${def.filtros.busqueda}`} value={busqueda} maxLength={80}
+                        onChange={(e) => escribir(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && setQ(busqueda.trim())} />
+                    )}
+                    {def.filtros.estados && (
+                      <select className="select" style={{ maxWidth: 220 }} value={estado} onChange={(e) => setEstado(e.target.value)}>
+                        <option value="">{def.filtros.etiquetaEstado || 'Estado'}: todos</option>
+                        {def.filtros.estados.map((x) => <option key={x} value={x}>{x}</option>)}
+                      </select>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {datos.error && <div className="alert alert-err">{datos.error.message}</div>}
+            {datos.data?.resumen?.length > 0 && (
+              <div className="grid g-4">
+                {datos.data.resumen.map((r) => <Kpi key={r.t} label={r.t} value={r.f === 'dinero' ? money(r.v) : r.f === 'pct' ? `${num(r.v)} %` : r.f === 'estrellas' ? `★ ${Number(r.v).toFixed(1)}` : typeof r.v === 'number' ? num0(r.v) : r.v} />)}
+              </div>
+            )}
+            {def.grafico && filas.length > 0 && <GraficoReporte g={def.grafico} filas={filas} />}
+
+            <div className="card tabla-reporte">
+              <div className="row between mb-8">
+                <span className="small muted">{datos.cargando ? 'Cargando…' : `${num0(filas.length)} resultado${filas.length === 1 ? '' : 's'}${filas.length >= 1000 ? ' (se muestran los primeros 1,000; afine los filtros)' : ''}`}</span>
+                {filas.some((f) => f._enlace) && <span className="xs muted no-imprimir">Haga clic en una fila para ver el detalle</span>}
+              </div>
+              <div className="table-wrap">
+                <table className="table">
+                  <thead><tr>{def.columnas.map((c) => <th key={c.k} className={['dinero', 'numero', 'pct'].includes(c.f) ? 'num' : ''}>{c.t}</th>)}</tr></thead>
+                  <tbody>
+                    {filas.map((f, i) => (
+                      <tr key={i} className={f._enlace ? 'clickable' : ''} onClick={() => f._enlace && navigate(f._enlace)}>
+                        {def.columnas.map((c) => <td key={c.k} className={['dinero', 'numero', 'pct'].includes(c.f) ? 'num' : ''}>{celda(f[c.k], c.f)}</td>)}
+                      </tr>
+                    ))}
+                    {!filas.length && !datos.cargando && <tr><td colSpan={def.columnas.length} className="center muted">No hay datos con estos filtros.</td></tr>}
+                  </tbody>
+                </table>
+              </div>
+              {def.nota && <div className="xs muted mt-8">{def.nota}</div>}
+            </div>
+          </div>
+        ) : <div className="card muted">{catalogo.cargando ? 'Cargando…' : 'No hay consultas disponibles.'}</div>}
       </div>
     </Page>
   )

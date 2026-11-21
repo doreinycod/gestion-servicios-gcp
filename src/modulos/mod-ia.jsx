@@ -3,11 +3,13 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Page } from '../components/Layout'
-import { Badge, Kpi, Modal } from '../components/ui'
+import { Badge } from '../components/ui'
 import { ListaPrestadores } from './mod-cat'
 import { get, post } from '../lib/api'
 import { useApi } from '../lib/useApi'
-import { fecha, fechaHora, hace, money, num0 } from '../lib/format'
+import { AsistenteReportes, TarjetaReporteIA, descargarCsv } from './mod-adm'
+import { useSession } from '../components/session'
+import { hace, money } from '../lib/format'
 
 const ICONO_CAT = { Técnicos: '🔧', Profesionales: '💼', Hogar: '🏠' }
 const EJEMPLOS = ['Se me fue la luz en la cocina y salta el breaker', 'Dame los 5 mejores servicios de luz', '¿Cuál es el mejor electricista?', '¿Cómo va mi solicitud?']
@@ -93,6 +95,9 @@ export function Asistente() {
     try { setMsgs(armarMensajes(await get(`/ia/conversaciones/${id}/mensajes`))) } catch (e) { setError(e.message) } finally { setCargando(false) }
   }
   const nueva = () => { setActiva(null); setMsgs([]); setError(''); entrada.current?.focus() }
+  // Abre el reporte en Consultas y reportes con los filtros que eligió la IA (con imprimir, lanza Guardar como PDF)
+  const abrirReporte = (r, opciones = {}) => navigate(`/consultas?${new URLSearchParams({ r: r.id, ...(r.desde ? { desde: r.desde, hasta: r.hasta } : {}),
+    ...(r.q ? { q: r.q } : {}), ...(r.estado ? { estado: r.estado } : {}), ...(opciones.imprimir ? { imprimir: '1' } : {}) })}`)
 
   const enviar = async (texto) => {
     const t = (texto ?? txt).trim()
@@ -109,8 +114,13 @@ export function Asistente() {
         setActiva(id)
       }
       const r = await post(`/ia/conversaciones/${id}/mensajes`, { texto: t })
-      setMsgs((m) => [...m, { de: 'bot', texto: r.respuesta, sugerencias: r.sugerencias || [], prestadores: r.prestadores || [] }])
+      setMsgs((m) => [...m, { de: 'bot', texto: r.respuesta, sugerencias: r.sugerencias || [], prestadores: r.prestadores || [], reportes: r.reportes || [] }])
       convs.recargar()
+      // Si pidió el documento: Excel se descarga y PDF abre la vista de impresión del reporte
+      const conDatos = (r.reportes || []).filter((x) => x.total_filas)
+      for (const x of conDatos.filter((x) => x.formato === 'excel')) await descargarCsv(x.id, { desde: x.desde, hasta: x.hasta, q: x.q, estado: x.estado }, x.titulo).catch(() => {})
+      const pdf = conDatos.find((x) => x.formato === 'pdf')
+      if (pdf) abrirReporte(pdf, { imprimir: true })
     } catch (e) {
       setError(e.message)
       setMsgs((m) => m.slice(0, -1))
@@ -167,6 +177,7 @@ export function Asistente() {
             {msgs.map((m, i) => (
               <div key={m.id || i} className={`msg ${m.de}`} style={{ whiteSpace: 'pre-wrap' }}>
                 {m.texto}
+                {m.reportes?.map((r, j) => <TarjetaReporteIA key={`r${j}`} r={r} onAbrir={abrirReporte} />)}
                 {m.sugerencias?.map((g) => <Sugerencia key={g.id_sugerencia} s={g} onSolicitar={() => solicitar(g)} onPrestadores={() => setVerPrestadores(g)} />)}
                 {m.prestadores?.map((e, i) => (
                   <PrestadorSugerido key={e.id_empleado} e={e} puesto={i + 1} onPerfil={() => navigate(`/prestadores/${e.id_empleado}`)}
@@ -190,67 +201,34 @@ export function Asistente() {
   )
 }
 
-// IA-P02 · Historial y sugerencias del asistente
-export function AsistenteAdmin() {
-  const d = useApi('/admin/ia')
-  const [ver, setVer] = useState(null)
-  const [detalle, setDetalle] = useState(null)
-  const abrir = async (id) => {
-    setVer(id)
-    setDetalle(null)
-    try { setDetalle(await get(`/admin/ia/conversaciones/${id}`)) } catch (e) { setDetalle({ error: e.message }) }
-  }
-  const k = d.data?.kpis
-  const pctAceptadas = k?.sugerencias ? Math.round((k.aceptadas / k.sugerencias) * 100) : 0
+// IA-P03 · Asistente IA del administrador y del prestador: chat para pedir reportes y ayuda con el sistema.
+// (Las conversaciones de los clientes se consultan en Consultas y reportes → Conversaciones del asistente IA.)
+export function AsistenteGestion() {
+  const navigate = useNavigate()
+  const { usuario } = useSession()
+  const rol = usuario?.rol
+  const base = rol === 'Administrador' ? '/admin/reportes' : '/prestador/reportes'
+  // "Abrir reporte completo": abre Consultas y reportes con el reporte y los filtros que eligió la IA
+  // con { imprimir: true } la pantalla de reportes abre la vista de impresión (Guardar como PDF) al cargar
+  const abrir = (r, opciones = {}) => navigate(`${base}?${new URLSearchParams({ r: r.id, ...(r.desde ? { desde: r.desde, hasta: r.hasta } : {}),
+    ...(r.q ? { q: r.q } : {}), ...(r.estado ? { estado: r.estado } : {}), ...(opciones.imprimir ? { imprimir: '1' } : {}) })}`)
   return (
-    <Page crumb="Administración · Asistente IA" title="Historial y sugerencias IA">
-      {d.data?.modo === 'local' && (
-        <div className="alert alert-warn mb-16">El asistente está en <b>modo básico</b> (respuestas por palabras clave). Configure <b>GEMINI_API_KEY</b> en backend/.env para usar Gemini.</div>
-      )}
-      {d.error && <div className="alert alert-err mb-16">{d.error.message}</div>}
-      <div className="grid g-4 mb-16">
-        <Kpi label="Conversaciones (mes)" value={k ? num0(k.conversaciones_mes) : '—'} />
-        <Kpi label="Sugerencias emitidas" value={k ? num0(k.sugerencias) : '—'} />
-        <Kpi label="Sugerencias aceptadas" value={k ? `${pctAceptadas}%` : '—'} foot={k ? `${num0(k.aceptadas)} solicitudes iniciadas` : null} up />
-        <Kpi label="Tokens consumidos" value={k ? num0(k.tokens) : '—'} foot={{ gemini: 'Google Gemini', claude: 'Claude (Anthropic)' }[d.data?.modo] || 'Modo básico (0 tokens)'} />
-      </div>
-      <div className="card">
-        <div className="card-title">Conversaciones recientes</div>
-        <div className="table-wrap">
-          <table className="table">
-            <thead><tr><th>#</th><th>Cliente</th><th>Primera pregunta</th><th>Servicio sugerido</th><th>Aceptada</th><th className="num">Tokens</th><th>Estado</th><th /></tr></thead>
-            <tbody>
-              {(d.data?.recientes || []).map((c) => (
-                <tr key={c.id_conversacion}>
-                  <td>{c.id_conversacion}</td><td>{c.cliente}<div className="xs muted">{fecha(c.fecha_inicio)}</div></td>
-                  <td>{c.primera_pregunta || <span className="muted">—</span>}</td><td>{c.servicio_sugerido || '—'}</td>
-                  <td>{c.servicio_sugerido ? <Badge color={c.aceptada ? 'green' : 'gray'}>{c.aceptada ? 'Sí' : 'No'}</Badge> : '—'}</td>
-                  <td className="num">{num0(c.tokens)}</td><td><Badge>{c.estado}</Badge></td>
-                  <td><button className="btn btn-outline btn-sm" onClick={() => abrir(c.id_conversacion)}>Ver</button></td>
-                </tr>
-              ))}
-              {d.data && !d.data.recientes.length && <tr><td colSpan={8} className="center muted">Aún no hay conversaciones.</td></tr>}
-            </tbody>
-          </table>
+    <Page crumb={`${rol === 'Administrador' ? 'Administración' : 'Prestador'} · Asistente IA`} title="Asistente virtual">
+      <div className="split" style={{ gridTemplateColumns: 'minmax(0,1fr) 260px' }}>
+        <AsistenteReportes rol={rol} onAbrir={abrir} completo />
+        <div className="card small" style={{ alignSelf: 'flex-start' }}>
+          <div className="card-title">¿Qué puedo pedirle?</div>
+          <ul style={{ paddingLeft: 18, margin: 0, display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <li><b>Cifras y reportes</b> con los datos reales del sistema, por periodo, búsqueda o estado.</li>
+            <li><b>Comparaciones</b>: "este mes contra el pasado".</li>
+            <li><b>Cómo hacer algo</b> en la plataforma, paso a paso.</li>
+          </ul>
+          <div className="alert alert-info xs mt-12">
+            La IA solo usa las consultas y reportes de tu rol, con tus permisos. No cambia datos: para aprobar, conciliar o facturar te indica la pantalla.
+          </div>
+          <button className="btn btn-outline btn-sm btn-block mt-12" onClick={() => navigate(base)}>📈 Ir a Consultas y reportes</button>
         </div>
       </div>
-      {ver && (
-        <Modal titulo={`Conversación #${ver}${detalle?.cliente ? ` · ${detalle.cliente}` : ''}`} onClose={() => setVer(null)} ancho={680}>
-          {!detalle ? <div className="muted small">Cargando…</div> : detalle.error ? <div className="alert alert-err">{detalle.error}</div> : (
-            <div className="col" style={{ gap: 8, maxHeight: '60vh', overflowY: 'auto' }}>
-              {detalle.mensajes.map((m) => (
-                <div key={m.id_mensaje} className={`msg ${m.emisor === 'Cliente' ? 'me' : 'bot'}`} style={{ whiteSpace: 'pre-wrap', maxWidth: '85%' }}>
-                  {m.contenido}
-                  <div className="xs" style={{ opacity: 0.7, marginTop: 4 }}>{fechaHora(m.fecha_envio)}{m.tokens ? ` · ${num0(m.tokens)} tokens` : ''}</div>
-                </div>
-              ))}
-              {detalle.sugerencias.length > 0 && (
-                <div className="small mt-8"><b>Sugerencias:</b> {detalle.sugerencias.map((g) => `${g.nombre}${g.aceptada ? ' (aceptada)' : ''}`).join(' · ')}</div>
-              )}
-            </div>
-          )}
-        </Modal>
-      )}
     </Page>
   )
 }
