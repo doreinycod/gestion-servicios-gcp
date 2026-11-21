@@ -867,5 +867,5 @@ export function reporteCsv({ def, filas, resumen }) {
     lineas.push('')
     for (const r of resumen) lineas.push(`${esc(r.t)},${esc(r.v)}`)
   }
-  return `﻿${lineas.join('\r\n')}`
+  return `\uFEFF${lineas.join('\r\n')}` // \uFEFF (BOM): Excel lee bien las tildes
 }
